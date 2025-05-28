@@ -5,12 +5,15 @@
 #include <vector>
 #include <stdexcept>
 #include <cstdint>
+#include <variant>
 #include "sqlite3.h"
+
+using SqlValue = std::variant<std::string, int, double, int64_t>;
 
 // Structure to hold information for adding an ingredient to a recipe
 struct RecipeIngredientInfo {
     std::string name;        // Name of the ingredient
-    double quantity;         // Quantity of the ingredient
+    double quantity;         // Quantity of the ingredient --- if this isn't specified, it will equal -1
     std::string unit;        // Unit for the quantity (e.g., "grams", "ml", "pcs")
     std::string notes;       // Optional notes for this ingredient in the recipe
     bool optional;           // Is this ingredient optional?
@@ -31,6 +34,31 @@ struct RecipeData {
     std::vector<RecipeIngredientInfo> ingredients; // List of ingredients for the recipe
     std::vector<std::string> tags;                 // List of tags associated with the recipe
     std::vector<std::string> instructions;         // List of cooking instructions (steps)
+};
+
+// Structure for holding search information
+struct SearchData {
+    // Main tables
+    std::string exact_name; // Exact name of the recipe (for exact match searches)
+    std::vector<uint16_t> prep_time_range;  // Preparation time range in minutes
+    std::vector<uint16_t> cook_time_range;  // Cooking time range in minutes
+    std::vector<uint16_t> servings_range;   // Servings range
+    bool is_favorite;   // Is this a favorite recipe? False will find both recipes that are favorited and ones that aren't
+    std::string source; // Source of the recipe (e.g., "Grandma's cookbook")
+    std::string source_url; // URL for the recipe source
+    std::string exact_author; // Exact name of the author of the recipe
+    std::vector<std::string> dates; // Range of dates to search for recipes added within this range
+
+    // FTS5
+    std::string name;       // Search within all names for this string
+    std::string keywords;   // Additional keywords to search (in standard FTS5 search format so one string has all keywords)
+    std::string author;     // Author to search for
+
+    // Many-to-Many
+    std::vector<std::string> ingredients;   // List of ingredients to search for
+    std::vector<std::string> tags;  // List of tags to search for
+    std::vector<std::string> exclude_tags;  // List of tags to exclude
+    std::vector<std::string> exclude_ingredients;   // List of ingredients to exclude
 };
 
 class Database {
@@ -106,11 +134,28 @@ public:
      * @return true if the database was emptied successfully, false otherwise.
      */
     bool emptyDatabase();
-    
+
     /**
      * @return true if the database connection is open, false otherwise.
      */
     bool isOpen() const;
+
+    /**
+     * Searches for recipes based on the provided search criteria.
+     * This includes searching by name, description, preparation time, cooking time, servings, favorite status, source, source URL, author, ingredients, tags, and date ranges.
+     * @param search_data The SearchData struct containing all search criteria
+     * @return A vector of recipe IDs that match the search criteria.
+     * If no recipes match the criteria, an empty vector is returned.
+     */
+    std::vector<long long> search(const SearchData& criteria);
+
+    /**
+     * Retrieves a recipe by its ID.
+     * @param recipe_id The ID of the recipe to retrieve
+     * @return A RecipeData struct containing all information about the recipe.
+     * If the recipe does not exist, an empty RecipeData struct is returned.
+     */
+    RecipeData getRecipeById(long long recipe_id);
 
 private:
     sqlite3* db_;                // Pointer to the SQLite database connection object
@@ -188,6 +233,20 @@ private:
      * @return true if the table exists, false otherwise.
      */
     bool tableExists(const std::string& tableName);
+
+    /**
+     * Builds a search query
+     * @param criteria The SearchData struct to build the search based on
+     * @return A pair containing the SQL query and the values to bind to it
+     */
+    std::pair<std::string, std::vector<SqlValue>> buildSearchQuery(const SearchData& criteria);
+
+    /**
+     * Executes a search
+     * @param query_parts std::pair of the sql and parameters created by buildSearchQuery
+     * @return std::vector of recipe ids that fall within the search criteria
+     */
+    std::vector<long long> executeSearch(std::pair<std::string, std::vector<SqlValue>> query_parts);
 };
 
 #endif // DATABASE_H

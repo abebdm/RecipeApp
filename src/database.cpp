@@ -2,9 +2,19 @@
 #include <iostream>
 #include <vector>
 #include <sstream>
+#include <algorithm>
+#include <iterator>
+#include <ranges>
+#include <numeric>
 
 
 Database* Database::inst = nullptr;
+
+std::vector<RecipeIngredientInfo> parseAllIngredients(const std::string& all_ingredients_str);
+
+std::vector<std::string> splitString(const std::string& str, char delimiter);
+
+RecipeIngredientInfo getIngredientInfo(const std::string& ingredient_str);
 
 Database::Database() : db_(nullptr), is_db_open_(false)
 {
@@ -186,6 +196,7 @@ bool Database::initialize() {
             recipe_id,
             name,
             description,
+            author,
             ingredients,
             tags,
             tokenize = 'porter unicode61'
@@ -194,8 +205,8 @@ bool Database::initialize() {
         CREATE TRIGGER IF NOT EXISTS recipe_after_insert
         AFTER INSERT ON recipes
         BEGIN
-            INSERT INTO search(rowid, name, description)
-            VALUES (new.recipe_id, new.name, new.description);
+            INSERT INTO search(rowid, name, description, author)
+            VALUES (new.recipe_id, new.name, new.description, new.author);
         END;
 
         CREATE TRIGGER IF NOT EXISTS recipe_after_update AFTER UPDATE ON recipes
@@ -204,6 +215,7 @@ bool Database::initialize() {
             SET
                 name = new.name,
                 description = new.description
+                author = new.author
             WHERE rowid = new.recipe_id;
         END;
 
@@ -269,6 +281,7 @@ bool Database::initialize() {
             r.recipe_id,
             r.name,
             r.description,
+            r.author,
             COALESCE(group_concat(DISTINCT i.name, '|'), ''),
             COALESCE(group_concat(DISTINCT t.name, '|'), '')
         FROM recipes AS r
@@ -1024,4 +1037,329 @@ bool Database::linkTagToRecipe(long long recipe_id, const std::string& tag) {
 
     sqlite3_finalize(stmt);
     return true;
+}
+
+RecipeData Database::getRecipeById(long long recipe_id) {
+    RecipeData recipe;
+    if (!isOpen()) {
+        std::cerr << "Database not open. Cannot get recipe by ID." << std::endl;
+        return recipe; // Return empty recipe
+    }
+
+    if (recipe_id <= 0) {
+        std::cerr << "Invalid recipe ID: " << recipe_id << std::endl;
+        return recipe; // Return empty recipe
+    }
+
+
+    // Get information from recipes table
+    sqlite3_stmt* stmt = nullptr;
+    const char* select_sql = R"(
+        SELECT
+            r.name,
+            r.description,
+            r.prep_time_minutes,
+            r.cook_time_minutes,
+            r.servings,
+            r.is_favorite,
+            r.source,
+            r.source_url,
+            r.author,
+            (SELECT COALESCE(GROUP_CONCAT(
+                COALESCE(i.name, '') || '|' ||
+                COALESCE(ri.quantity, '') || '|' ||
+                COALESCE(ri.unit, '') || '|' ||
+                COALESCE(ri.notes, '') || '|' ||
+                COALESCE(ri.optional, '0'),
+                char(10)
+            ), '')
+            FROM recipe_ingredients ri JOIN ingredients i ON ri.ingredient_id = i.ingredient_id
+            WHERE ri.recipe_id = r.recipe_id) AS ingredient_list,
+
+            (SELECT COALESCE(GROUP_CONCAT(t.name, '|'), '')
+            FROM recipe_tags rt JOIN tags t ON rt.tag_id = t.tag_id
+            WHERE rt.recipe_id = r.recipe_id) AS tag_list,
+
+            (SELECT COALESCE(GROUP_CONCAT(ins.instruction, '|'), '')
+            FROM instructions ins
+            WHERE ins.recipe_id = r.recipe_id
+            ORDER BY ins.step_number) AS instruction_list
+        FROM
+            recipes AS r
+        WHERE
+            r.recipe_id = ?;
+    )";
+
+    if (sqlite3_prepare_v2(db_, select_sql, -1, &stmt, nullptr) != SQLITE_OK) {
+        std::cerr << "Failed to prepare select recipe statement: " << sqlite3_errmsg(db_) << std::endl;
+        return recipe; // Return empty recipe
+    }
+
+    if (sqlite3_bind_int64(stmt, 1, recipe_id) != SQLITE_OK) {
+        std::cerr << "Failed to bind recipe ID: " << sqlite3_errmsg(db_) << std::endl;
+        sqlite3_finalize(stmt);
+        return recipe; // Return empty recipe
+    }
+
+    int rc = sqlite3_step(stmt);
+    if (rc == SQLITE_ROW) {
+        recipe.name = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+        recipe.description = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+        recipe.prep_time_minutes = sqlite3_column_int(stmt, 2);
+        recipe.cook_time_minutes = sqlite3_column_int(stmt, 3);
+        recipe.servings = sqlite3_column_int(stmt, 4);
+        recipe.is_favorite = sqlite3_column_int(stmt, 5) != 0;
+        recipe.source = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 6));
+        recipe.source_url = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 7));
+        recipe.author = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 8));
+        recipe.ingredients = parseAllIngredients(reinterpret_cast<const char*>(sqlite3_column_text(stmt, 9)));
+        recipe.tags = splitString(reinterpret_cast<const char*>(sqlite3_column_text(stmt, 10)), '|');
+        std::string instruction_list = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 11));
+    } else if (rc != SQLITE_DONE) {
+        std::cerr << "Failed to get recipe by ID: " << sqlite3_errmsg(db_) << std::endl;
+    }
+
+    return recipe;
+}
+
+std::vector<std::string> splitString(const std::string& str, char delimiter) {
+    std::vector<std::string> tokens;
+    std::stringstream ss(str);
+    std::string token;
+    while (std::getline(ss, token, delimiter)) {
+        if (!token.empty()) {
+            tokens.push_back(token);
+        }
+    }
+    return tokens;
+}
+
+RecipeIngredientInfo getIngredientInfo(const std::string& ingredient_str) {
+    RecipeIngredientInfo ingredient;
+    std::stringstream ss(ingredient_str);
+    std::string token;
+
+    std::getline(ss, token, '|');
+    ingredient.name = token;
+
+    double q;
+    try {
+        std::getline(ss, token, '|');
+        q = std::stod(token);
+    } catch (const std::invalid_argument& ia) {
+        q = -1;
+    }
+    ingredient.quantity = q;
+
+    std::getline(ss, token, '|');
+    ingredient.unit = token;
+
+    std::getline(ss, token, '|');
+    ingredient.notes = token;
+
+    std::getline(ss, token, '|');
+    if (token == "1") {
+        ingredient.optional = true;
+    } else {
+        ingredient.optional = false;
+    }
+
+    return ingredient;
+}
+
+std::vector<RecipeIngredientInfo> parseAllIngredients(const std::string& all_ingredients_str) {
+    auto result_view = splitString(all_ingredients_str, '\n') | std::views::transform(getIngredientInfo);
+    
+    return std::vector<RecipeIngredientInfo>(result_view.begin(), result_view.end());
+}
+
+std::pair<std::string, std::vector<SqlValue>> Database::buildSearchQuery(const SearchData& criteria) {
+    std::string sql = "SELECT DISTINCT r.recipe_id FROM recipes AS r";
+    std::vector<std::string> conditions;
+    std::vector<SqlValue> params;
+
+    // Handle FTS criteria
+    std::vector<std::string> fts_criteria;
+    if (!criteria.name.empty()) {
+        fts_criteria.push_back("{name} : ?");
+        params.push_back(criteria.name);
+    }
+    if (!criteria.author.empty()) {
+        fts_criteria.push_back("{author} : ?");
+        params.push_back(criteria.name);
+    }
+    if (!criteria.keywords.empty()) {
+        fts_criteria.push_back("?");
+        params.push_back(criteria.keywords);
+    }
+
+    if (!fts_criteria.empty()) {
+        std::string fts_query = std::accumulate(std::next(fts_criteria.begin()), fts_criteria.end(), fts_criteria.front(),
+            [](std::string a, std::string b) { return a + " AND " + b; });
+        conditions.push_back("r.recipe_in IN (SELECT rowid FROM search WHERE search MATCH ?)");
+        params.push_back(fts_query);
+    }
+
+    // Handle main table criteria
+    if (criteria.exact_name.empty()) {
+        conditions.push_back("r.name = ?");
+        params.push_back(criteria.exact_name);
+    }
+    if (!criteria.exact_author.empty()) {
+        conditions.push_back("r.author = ?");
+        params.push_back(criteria.exact_author);
+    }
+    if (criteria.prep_time_range.size() == 2) {
+        conditions.push_back("r.prep_time_minutes BETWEEN ? AND ?");
+        params.push_back(criteria.prep_time_range[0]);
+        params.push_back(criteria.prep_time_range[1]);
+    }
+    if (criteria.cook_time_range.size() == 2) {
+        conditions.push_back("r.prep_time_minutes BETWEEN ? AND ?");
+        params.push_back(criteria.cook_time_range[0]);
+        params.push_back(criteria.cook_time_range[1]);
+    }
+    if (criteria.servings_range.size() == 2) {
+        conditions.push_back("r.prep_time_minutes BETWEEN ? AND ?");
+        params.push_back(criteria.servings_range[0]);
+        params.push_back(criteria.servings_range[1]);
+    }
+    if (criteria.is_favorite) {
+        conditions.push_back("r.is_favorite = 1");
+    }
+    if (criteria.dates.size() == 2 && !criteria.dates[0].empty() && !criteria.dates[1].empty()) {
+        conditions.push_back("date(r.date_added) BETWEEN ? AND ?");
+        params.push_back(criteria.dates[0]);
+        params.push_back(criteria.dates[1]);
+    }
+    if (criteria.source.empty()) {
+        conditions.push_back("r.source = ?");
+        params.push_back(criteria.source);
+    }
+    if (criteria.source_url.empty()) {
+        conditions.push_back("r.source_url = ?");
+        params.push_back(criteria.source_url);
+    }
+
+    // Many-to-Many
+    if (!criteria.tags.empty()) {
+        std::string placeholders;
+        for (int i = 0; i < criteria.tags.size(); ++i) {
+            placeholders += (i == 0 ? "?" : ": ?");
+        }
+        std::string subquery = R"(r.recipe_id IN (
+            SELECT rt.recipe_id FROM recipe_tags rt JOIN tags t ON rt.tag_id = t.tag_id
+            WHERE t.name in ()" + placeholders + R"()
+            GROUP BY rt.recipe_id
+            HAVING COUNT (DISTINCT t.name) = ?
+        ))";
+        conditions.push_back(subquery);
+        for (const auto& tag : criteria.tags) {
+            params.push_back(tag);
+        }
+        params.push_back(static_cast<int64_t>(criteria.tags.size()));
+    }
+    if (!criteria.exclude_tags.empty()) {
+        std::string placeholders;
+        for (size_t i = 0; i < criteria.exclude_tags.size(); ++i) {
+            placeholders += (i == 0 ? "?" : ", ?");
+        }
+
+        std::string subquery = R"(NOT EXISTS (
+            SELECT 1 FROM recipe_tags rt JOIN tags t ON rt.tag_id = t.tag_id
+            WHERE rt.recipe_id = r.recipe_id AND t.name IN ()" + placeholders + R"()
+        ))";
+
+        conditions.push_back(subquery);
+
+        for (const auto& tag : criteria.exclude_tags) {
+            params.push_back(tag);
+        }
+    }
+    if (!criteria.ingredients.empty()) {
+        std::string placeholders;
+        for (int i = 0; i < criteria.ingredients.size(); ++i) {
+            placeholders += (i == 0 ? "?" : ": ?");
+        }
+        std::string subquery = R"(r.recipe_id IN (
+            SELECT ri.recipe_id FROM recipe_ingredients ri JOIN ingredients i ON ri.ingredient_id = i.ingredient_id
+            WHERE i.name in ()" + placeholders + R"()
+            GROUP BY ri.recipe_id
+            HAVING COUNT (DISTINCT i.name) = ?
+        ))";
+        conditions.push_back(subquery);
+        for (const auto& ingredient : criteria.ingredients) {
+            params.push_back(ingredient);
+        }
+        params.push_back(static_cast<int64_t>(criteria.ingredients.size()));
+    }
+    if (!criteria.exclude_ingredients.empty()) {
+        std::string placeholders;
+        for (size_t i = 0; i < criteria.exclude_ingredients.size(); ++i) {
+            placeholders += (i == 0 ? "?" : ", ?");
+        }
+
+        std::string subquery = R"(NOT EXISTS (
+            SELECT 1 FROM recipe_ingredients ri JOIN ingredients i ON ri.ingredient_id = i.ingredient_id
+            WHERE ri.recipe_id = r.recipe_id AND i.name IN ()" + placeholders + R"()
+        ))";
+
+        conditions.push_back(subquery);
+
+        for (const auto& ingredient : criteria.exclude_ingredients) {
+            params.push_back(ingredient);
+        }
+    }
+    if (!conditions.empty()) {
+        sql += " WHERE " + conditions[0];
+        for (size_t i = 1; i < conditions.size(); ++i) {
+            sql += " AND " + conditions[i];
+        }
+    }
+    sql += ";";
+
+    return {sql, params};
+}
+
+std::vector<long long> Database::executeSearch(std::pair<std::string, std::vector<SqlValue>> query_parts) {
+    const std::string& sql = query_parts.first;
+    const std::vector<SqlValue>& params = query_parts.second;
+
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) {
+        std::cerr << "Failed to prepare search statement: " << sqlite3_errmsg(db_) << std::endl;
+        return {};
+    }
+
+    for (int i = 0; i < params.size(); ++i) {
+        std::visit([&](auto&& arg) {
+            using T = std::decay_t<decltype(arg)>;
+            if constexpr (std::is_same_v<T, std::string>) {
+                sqlite3_bind_text(stmt, i + 1, arg.c_str(), -1, SQLITE_TRANSIENT);
+            } else if constexpr (std::is_same_v<T, int> || std::is_same_v<T, uint16_t>) {
+                sqlite3_bind_int(stmt, i + 1, arg);
+            } else if constexpr (std::is_same_v<T, int64_t>) {
+                sqlite3_bind_int64(stmt, i + 1, arg);
+            } else if constexpr (std::is_same_v<T, double>) {
+                sqlite3_bind_double(stmt, i + 1, arg);
+            }
+        }, params[i]);
+    }
+
+    std::vector<long long> results;
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        results.push_back(sqlite3_column_int64(stmt, 0));
+    }
+
+    sqlite3_finalize(stmt);
+    return results;
+}
+
+std::vector<long long> Database::search(const SearchData& criteria) {
+    if (!isOpen()) {
+        std::cerr << "Database not open. Cannot get recipe by ID." << std::endl;
+        return {}; // Return empty recipe
+    }
+
+    return executeSearch(buildSearchQuery(criteria));
 }
