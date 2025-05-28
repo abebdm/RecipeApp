@@ -33,13 +33,6 @@ bool Database::open() {
 
     is_db_open_ = true;
 
-    // Prevents things like deleting a recipe without also handling its ingredients and tags or inserting an ingredient into the recipe_ingredients table with an invalid recipe
-    if (!executeSQL("PRAGMA foreign_keys = ON;")) {
-        std::cerr << "Failed to enable foreign key constraints." << std::endl;
-        close();
-        return false;
-    }
-
     // Create necessary tables if they do not already exist
     if (!initialize()) {
         std::cerr << "Failed to create necessary tables." << std::endl;
@@ -114,88 +107,189 @@ bool Database::initialize() {
         return false;
     }
 
-    if (!tableExists("recipes")) {
-        const char* create_recipes_table_sql = R"(
-            CREATE TABLE IF NOT EXISTS recipes (
-                recipe_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL,
-                description TEXT,
-                prep_time_minutes INTEGER,
-                cook_time_minutes INTEGER,
-                servings INTEGER,
-                is_favorite BOOLEAN DEFAULT 0 CHECK (is_favorite IN (0, 1)),
-                date_added TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                source TEXT,
-                source_url TEXT,
-                author TEXT
-            );
-        )";
-        if (!executeSQL(create_recipes_table_sql)) return false;
-    }
-    
-    if (!tableExists("ingredients")) {
-        const char* create_ingredients_table_sql = R"(
-            CREATE TABLE IF NOT EXISTS ingredients (
-                ingredient_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL UNIQUE
-            );
-        )";
-        if (!executeSQL(create_ingredients_table_sql)) return false;
+    // Prevents things like deleting a recipe without also handling its ingredients and tags or inserting an ingredient into the recipe_ingredients table with an invalid recipe
+    if (!executeSQL("PRAGMA foreign_keys = ON;")) {
+        std::cerr << "Failed to enable foreign key constraints." << std::endl;
+        close();
+        return false;
     }
 
-    if (!tableExists("tags")) {
-        const char* create_tags_table_sql = R"(
-            CREATE TABLE IF NOT EXISTS tags (
-                tag_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL UNIQUE
-            );
-        )";
-        if (!executeSQL(create_tags_table_sql)) return false;
+    if (!executeSQL("BEGIN TRANSACTION;")) {
+        std::cerr << "Failed to begin transaction." << std::endl;
+        return false;
     }
 
-    if (!tableExists("recipe_ingredients")) {
-        const char* create_recipe_ingredients_table_sql = R"(
-            CREATE TABLE IF NOT EXISTS recipe_ingredients (
-                recipe_id INTEGER NOT NULL,
-                ingredient_id INTEGER NOT NULL,
-                quantity REAL,
-                unit TEXT,
-                notes TEXT,
-                optional BOOLEAN DEFAULT 0 CHECK (optional IN (0, 1)),
-                PRIMARY KEY (recipe_id, ingredient_id),
-                FOREIGN KEY (recipe_id) REFERENCES recipes(recipe_id) ON DELETE CASCADE,
-                FOREIGN KEY (ingredient_id) REFERENCES ingredients(ingredient_id) ON DELETE CASCADE
-            );
-        )";
-        if (!executeSQL(create_recipe_ingredients_table_sql)) return false;
+    const char* schema_script = R"(
+        CREATE TABLE IF NOT EXISTS recipes (
+            recipe_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            description TEXT,
+            prep_time_minutes INTEGER,
+            cook_time_minutes INTEGER,
+            servings INTEGER,
+            is_favorite BOOLEAN DEFAULT 0 CHECK (is_favorite IN (0, 1)),
+            date_added TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            source TEXT,
+            source_url TEXT,
+            author TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS ingredients (
+            ingredient_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE
+        );
+
+        CREATE TABLE IF NOT EXISTS tags (
+            tag_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE
+        );
+
+        CREATE TABLE IF NOT EXISTS recipe_ingredients (
+            recipe_id INTEGER NOT NULL,
+            ingredient_id INTEGER NOT NULL,
+            quantity REAL,
+            unit TEXT,
+            notes TEXT,
+            optional BOOLEAN DEFAULT 0 CHECK (optional IN (0, 1)),
+            PRIMARY KEY (recipe_id, ingredient_id),
+            FOREIGN KEY (recipe_id) REFERENCES recipes(recipe_id) ON DELETE CASCADE,
+            FOREIGN KEY (ingredient_id) REFERENCES ingredients(ingredient_id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS recipe_tags (
+            recipe_id INTEGER NOT NULL,
+            tag_id INTEGER NOT NULL,
+            PRIMARY KEY (recipe_id, tag_id),
+            FOREIGN KEY (recipe_id) REFERENCES recipes(recipe_id) ON DELETE CASCADE,
+            FOREIGN KEY (tag_id) REFERENCES tags(tag_id) ON DELETE CASCADE
+        );
+        
+        CREATE TABLE IF NOT EXISTS instructions (
+            instruction_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            recipe_id INTEGER NOT NULL,
+            step_number INTEGER NOT NULL,
+            instruction TEXT NOT NULL,
+            FOREIGN KEY (recipe_id) REFERENCES recipes(recipe_id) ON DELETE CASCADE,
+            UNIQUE (recipe_id, step_number)
+        );
+    )";
+
+    if (!executeSQL(schema_script)) {
+        std::cerr << "Failed to create base tables." << std::endl;
+        executeSQL("ROLLBACK;");
+        return false;
     }
 
-    if (!tableExists("recipe_tags")) {
-        const char* create_recipe_tags_table_sql = R"(
-            CREATE TABLE IF NOT EXISTS recipe_tags (
-                recipe_id INTEGER NOT NULL,
-                tag_id INTEGER NOT NULL,
-                PRIMARY KEY (recipe_id, tag_id),
-                FOREIGN KEY (recipe_id) REFERENCES recipes(recipe_id) ON DELETE CASCADE,
-                FOREIGN KEY (tag_id) REFERENCES tags(tag_id) ON DELETE CASCADE
-            );
-        )";
-        if (!executeSQL(create_recipe_tags_table_sql)) return false;
+    // Create FTS5 virtual table
+    const char* create_fts_table_sql = R"(
+        CREATE VIRTUAL TABLE IF NOT EXISTS search USING fts5(
+            recipe_id,
+            name,
+            description,
+            ingredients,
+            tags,
+            tokenize = 'porter unicode61'
+        );
+
+        CREATE TRIGGER IF NOT EXISTS recipe_after_insert
+        AFTER INSERT ON recipes
+        BEGIN
+            INSERT INTO search(rowid, name, description)
+            VALUES (new.recipe_id, new.name, new.description);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS recipe_after_update AFTER UPDATE ON recipes
+        BEGIN
+            UPDATE search
+            SET
+                name = new.name,
+                description = new.description
+            WHERE rowid = new.recipe_id;
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS recipe_after_delete AFTER DELETE ON recipes
+        BEGIN
+            DELETE FROM search WHERE rowid = old.recipe_id;
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS update_ingredients_on_insert
+        AFTER INSERT ON recipe_ingredients
+        BEGIN
+            UPDATE search
+            SET ingredients = (
+                SELECT COALESCE(group_concat(name, '|'), '')
+                from INGREDIENTS i
+                JOIN recipe_ingredients ri ON i.ingredient_id = ri.ingredient_id
+                WHERE ri.recipe_id = new.recipe_id
+            )
+            WHERE rowid = NEW.recipe_id;
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS update_ingredients_on_delete
+        AFTER DELETE ON recipe_ingredients
+        BEGIN
+            UPDATE search
+            SET ingredients = (
+                SELECT COALESCE(group_concat(name, '|'), '')
+                FROM ingredients i
+                JOIN recipe_ingredients ri ON i.ingredient_id = ri.ingredient_id
+                WHERE ri.recipe_id = OLD.recipe_id
+            )
+            WHERE rowid = OLD.recipe_id;
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS update_tags_on_insert
+        AFTER INSERT ON recipe_tags
+        BEGIN
+            UPDATE search
+            SET tags = (
+                SELECT COALESCE(group_concat(name, '|'), '')
+                FROM tags t
+                JOIN recipe_tags rt ON t.tag_id = rt.tag_id
+                WHERE rt.recipe_id = NEW.recipe_id
+            )
+            WHERE rowid = NEW.recipe_id;
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS update_tags_on_delete
+        AFTER DELETE ON recipe_tags
+        BEGIN
+            UPDATE search
+            SET tags = (
+                SELECT COALESCE(group_concat(name, '|'), '')
+                FROM tags t
+                JOIN recipe_tags rt ON t.tag_id = rt.tag_id
+                WHERE rt.recipe_id = OLD.recipe_id
+            )
+            WHERE rowid = OLD.recipe_id;
+        END;
+
+        INSERT INTO search (rowid, name, description, ingredients, tags)
+        SELECT
+            r.recipe_id,
+            r.name,
+            r.description,
+            COALESCE(group_concat(DISTINCT i.name, '|'), ''),
+            COALESCE(group_concat(DISTINCT t.name, '|'), '')
+        FROM recipes AS r
+        LEFT JOIN recipe_ingredients AS ri ON r.recipe_id = ri.recipe_id
+        LEFT JOIN ingredients AS i ON ri.ingredient_id = i.ingredient_id
+        LEFT JOIN recipe_tags AS rt ON r.recipe_id = rt.recipe_id
+        LEFT JOIN tags AS t ON rt.tag_id = t.tag_id
+        GROUP BY
+            r.recipe_id;
+    )";
+    if (!executeSQL(create_fts_table_sql)) {
+        std::cerr << "Failed to create FTS5 virtual table." << std::endl;
+        executeSQL("ROLLBACK;");
+        return false;
     }
 
-    if (!tableExists("instructions")) {
-        const char* create_instructions_table_sql = R"(
-            CREATE TABLE IF NOT EXISTS instructions (
-                instruction_id INTEGER PRIMARY KEY AUTOINCREMENT, /* Changed from Python's INTEGER PRIMARY KEY */
-                recipe_id INTEGER NOT NULL,
-                step_number INTEGER NOT NULL,
-                instruction TEXT NOT NULL,
-                FOREIGN KEY (recipe_id) REFERENCES recipes(recipe_id) ON DELETE CASCADE,
-                UNIQUE (recipe_id, step_number) /* Ensure step numbers are unique per recipe */
-            );
-        )";
-        if (!executeSQL(create_instructions_table_sql)) return false;
-
+    if (!executeSQL("COMMIT;")) {
+        std::cerr << "Failed to commit transaction." << std::endl;
+        // Attempt to rollback, though the state might be inconsistent if commit itself fails
+        executeSQL("ROLLBACK;");
+        return false;
     }
 
     return true;
