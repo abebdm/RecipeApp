@@ -1,6 +1,8 @@
 #include <iostream>
-#include "database.h" // Our database class
-#include "main.h"     // Corresponding header for main (currently minimal)
+#include <vector>
+#include <cassert>
+#include "database.h"
+#include "main.h"
 
 // Function to create a sample recipe for demonstration
 RecipeData createSamplePancakesRecipe() {
@@ -60,7 +62,7 @@ RecipeData createSampleSpaghettiRecipe() {
         {"Fresh parsley", 0.25, "cup", "chopped", false},
         {"Salt", 1, "pinch", "to taste", false}
     };
-    
+
     spaghetti.tags = {"pasta", "italian", "quick", "garlic"};
 
     spaghetti.instructions = {
@@ -76,52 +78,127 @@ RecipeData createSampleSpaghettiRecipe() {
     return spaghetti;
 }
 
+void printRecipe(const RecipeData& recipe) {
+    std::cout << "Name: " << recipe.name << std::endl;
+    std::cout << "Description: " << recipe.description << std::endl;
+    std::cout << "Author: " << recipe.author << std::endl;
+    std::cout << "Ingredients: " << std::endl;
+    for (const auto& ingredient : recipe.ingredients) {
+        std::cout << "  - " << ingredient.name << " " << ingredient.quantity << " " << ingredient.unit << std::endl;
+    }
+    std::cout << "Tags: " << std::endl;
+    for (const auto& tag : recipe.tags) {
+        std::cout << "  - " << tag << std::endl;
+    }
+    std::cout << "Instructions: " << std::endl;
+    for (const auto& instruction : recipe.instructions) {
+        std::cout << "  - " << instruction << std::endl;
+    }
+    std::cout << std::endl;
+}
 
 int main() {
     std::cout << "Recipe Manager C++ Demo" << std::endl;
 
-    // Define the path to the database file.
-    // For this demo, it's created in the current working directory.
-    // You might want to use a more specific path in a real application.
-    std::string db_file_path = "recipes_cpp.db";
     Database* recipe_db_ptr = Database::instance();
     Database& recipe_db = *recipe_db_ptr;
 
-    std::cout << "Attempting to open database: " << db_file_path << std::endl;
-    if (!recipe_db.open("./recipes.db")) {
-        std::cerr << "Failed to open or initialize the database. Exiting." << std::endl;
+    // Test open
+    std::cout << "--- Testing Database Open ---" << std::endl;
+    if (!recipe_db.open("./test.db")) {
+        std::cerr << "Failed to open database!" << std::endl;
         return 1;
     }
     std::cout << "Database opened successfully." << std::endl;
 
-    // Create a sample recipe
+    // Test emptyDatabase
+    std::cout << "\n--- Testing Empty Database ---" << std::endl;
+    recipe_db.emptyDatabase();
+    std::cout << "Database emptied." << std::endl;
+
+    // Test addRecipe
+    std::cout << "\n--- Testing Add Recipe ---" << std::endl;
     RecipeData pancakes = createSamplePancakesRecipe();
-    std::cout << "\nAttempting to add recipe: " << pancakes.name << std::endl;
-    long long pancake_recipe_id = recipe_db.addRecipe(pancakes);
+    long long pancake_id = recipe_db.addRecipe(pancakes);
+    assert(pancake_id != -1);
+    std::cout << "Pancakes recipe added with ID: " << pancake_id << std::endl;
 
-    if (pancake_recipe_id != -1) {
-        std::cout << "Recipe '" << pancakes.name << "' added successfully with ID: " << pancake_recipe_id << std::endl;
-    } else {
-        std::cerr << "Failed to add recipe: " << pancakes.name << std::endl;
-    }
-
-    // Create another sample recipe
     RecipeData spaghetti = createSampleSpaghettiRecipe();
-    std::cout << "\nAttempting to add recipe: " << spaghetti.name << std::endl;
-    long long spaghetti_recipe_id = recipe_db.addRecipe(spaghetti);
+    long long spaghetti_id = recipe_db.addRecipe(spaghetti);
+    assert(spaghetti_id != -1);
+    std::cout << "Spaghetti recipe added with ID: " << spaghetti_id << std::endl;
 
-    if (spaghetti_recipe_id != -1) {
-        std::cout << "Recipe '" << spaghetti.name << "' added successfully with ID: " << spaghetti_recipe_id << std::endl;
-    } else {
-        std::cerr << "Failed to add recipe: " << spaghetti.name << std::endl;
-    }
-    
-    // You could add more database operations here (e.g., querying recipes)
+    // Test getRecipeById
+    std::cout << "\n--- Testing Get Recipe By ID ---" << std::endl;
+    auto fetched_pancakes_optional = recipe_db.getRecipeById(pancake_id);
+    assert(fetched_pancakes_optional.has_value());
+    RecipeData fetched_pancakes = fetched_pancakes_optional.value();
+    printRecipe(fetched_pancakes);
 
-    std::cout << "\nClosing database." << std::endl;
+    // Test search
+    std::cout << "\n--- Testing Search ---" << std::endl;
+    SearchData search_criteria;
+    search_criteria.keywords = "pancakes";
+    std::vector<long long> search_results = recipe_db.search(search_criteria);
+    assert(search_results.size() == 1);
+    assert(search_results[0] == pancake_id);
+    std::cout << "Found " << search_results.size() << " recipe(s) with keyword 'pancakes'" << std::endl;
+
+    search_criteria = {};
+    search_criteria.ingredients = {"Garlic", "Spaghetti"};
+    search_results = recipe_db.search(search_criteria);
+    assert(search_results.size() == 1);
+    assert(search_results[0] == spaghetti_id);
+    std::cout << "Found " << search_results.size() << " recipe(s) with ingredients 'Garlic' and 'Spaghetti'" << std::endl;
+
+    // Test deleteRecipe
+    std::cout << "\n--- Testing Delete Recipe ---" << std::endl;
+    assert(recipe_db.deleteRecipe(pancake_id));
+    std::cout << "Deleted recipe with ID: " << pancake_id << std::endl;
+    auto deleted_pancakes_optional = recipe_db.getRecipeById(pancake_id);
+    assert(!deleted_pancakes_optional.has_value() || deleted_pancakes_optional.value().name.empty());
+
+
+    // Test mergeDatabase
+    std::cout << "\n--- Testing Merge Database ---" << std::endl;
+    // Create and populate the second database
+    recipe_db.loadDatabase("./other.db");
+    recipe_db.emptyDatabase();
+    RecipeData pizza = createSamplePancakesRecipe(); // Using pancakes recipe as a stand-in for a new recipe
+    pizza.name = "Pizza";
+    pizza.tags = {"dinner", "italian"};
+    long long pizza_id = recipe_db.addRecipe(pizza);
+    assert(pizza_id != -1);
+
+    // Re-open the main database and merge
+    recipe_db.loadDatabase("./test.db");
+    assert(recipe_db.mergeDatabase("./other.db"));
+    std::cout << "Merged other.db into test.db" << std::endl;
+
+    search_criteria = {};
+    search_criteria.keywords = "Pizza";
+    search_results = recipe_db.search(search_criteria);
+    assert(search_results.size() == 1);
+    std::cout << "Found " << search_results.size() << " recipe(s) with keyword 'Pizza' after merge" << std::endl;
+
+
+    // Test loadDatabase
+    std::cout << "\n--- Testing Load Database ---" << std::endl;
+    assert(recipe_db.loadDatabase("./other.db"));
+    std::cout << "Loaded other.db" << std::endl;
+
+    search_criteria = {};
+    search_criteria.keywords = "Pizza";
+    search_results = recipe_db.search(search_criteria);
+    assert(search_results.size() == 1);
+    std::cout << "Found " << search_results.size() << " recipe(s) with keyword 'Pizza' in other.db" << std::endl;
+
+    // Test close
+    std::cout << "\n--- Testing Close Database ---" << std::endl;
     recipe_db.close();
-    std::cout << "Program finished." << std::endl;
+    std::cout << "Database closed." << std::endl;
+
+    std::cout << "\nAll tests passed!" << std::endl;
 
     return 0;
 }
-

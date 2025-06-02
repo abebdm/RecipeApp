@@ -6,6 +6,8 @@
 #include <stdexcept>
 #include <cstdint>
 #include <variant>
+#include <optional>
+#include <iostream>
 #include "sqlite3.h"
 
 using SqlValue = std::variant<std::string, int, double, int64_t>;
@@ -43,7 +45,7 @@ struct SearchData {
     std::vector<uint16_t> prep_time_range;  // Preparation time range in minutes
     std::vector<uint16_t> cook_time_range;  // Cooking time range in minutes
     std::vector<uint16_t> servings_range;   // Servings range
-    bool is_favorite;   // Is this a favorite recipe? False will find both recipes that are favorited and ones that aren't
+    bool is_favorite = false;   // Is this a favorite recipe? False will find both recipes that are favorited and ones that aren't
     std::string source; // Source of the recipe (e.g., "Grandma's cookbook")
     std::string source_url; // URL for the recipe source
     std::string exact_author; // Exact name of the author of the recipe
@@ -154,8 +156,9 @@ public:
      * @param recipe_id The ID of the recipe to retrieve
      * @return A RecipeData struct containing all information about the recipe.
      * If the recipe does not exist, an empty RecipeData struct is returned.
+     * If an error occurs, std::nullopt is returned
      */
-    RecipeData getRecipeById(long long recipe_id);
+    std::optional<RecipeData> getRecipeById(long long recipe_id);
 
 private:
     sqlite3* db_;                // Pointer to the SQLite database connection object
@@ -247,6 +250,24 @@ private:
      * @return std::vector of recipe ids that fall within the search criteria
      */
     std::vector<long long> executeSearch(std::pair<std::string, std::vector<SqlValue>> query_parts);
+};
+
+// RAII wrapper for sqlite statements
+class SqliteStatement {
+public:
+    sqlite3_stmt* stmt = nullptr;
+    SqliteStatement(sqlite3* db, const char* sql) {
+        if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+            std::cerr << "Failed to prepare statement: " << sqlite3_errmsg(db) << std::endl;
+            stmt = nullptr;
+        }
+    }
+    ~SqliteStatement() {
+        if (stmt) sqlite3_finalize(stmt);
+    }
+    operator sqlite3_stmt*() const { return stmt; }
+    SqliteStatement(const SqliteStatement&) = delete;
+    SqliteStatement& operator=(const SqliteStatement&) = delete;
 };
 
 #endif // DATABASE_H

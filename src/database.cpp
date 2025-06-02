@@ -10,24 +10,26 @@
 
 Database* Database::inst = nullptr;
 
+
 std::vector<RecipeIngredientInfo> parseAllIngredients(const std::string& all_ingredients_str);
+
 
 std::vector<std::string> splitString(const std::string& str, char delimiter);
 
+
 RecipeIngredientInfo getIngredientInfo(const std::string& ingredient_str);
+
 
 Database::Database() : db_(nullptr), is_db_open_(false)
 {
 }
 
+
 Database* Database::instance() {
-     {
-        if (!inst) {
-            inst = new Database();
-        }
-        return inst;
-    }
+    static Database inst;
+    return &inst;
 }
+
 
 bool Database::open() {
     if (is_db_open_) return true;
@@ -54,14 +56,18 @@ bool Database::open() {
     return true;
 }
 
+
 bool Database::open(const std::string& db_path) {
+    if (is_db_open_) close();
     db_path_ = db_path;
     return open();
 }
 
+
 Database::~Database() {
     close();
 }
+
 
 void Database::close() {
     if (is_db_open_ && db_ != nullptr) {
@@ -71,9 +77,11 @@ void Database::close() {
     }
 }
 
+
 bool Database::isOpen() const {
     return is_db_open_ && db_ != nullptr;
 }
+
 
 bool Database::executeSQL(const char* sql) {
     if (!isOpen()) {
@@ -97,16 +105,15 @@ bool Database::tableExists(const std::string& tableName) {
         return false;
     }
 
-    sqlite3_stmt* stmt = nullptr;
     std::string sql = "SELECT name FROM sqlite_master WHERE type='table' AND name=?;";
-    int rc = sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr);
-    if (rc != SQLITE_OK) {
-        std::cerr << "Failed to prepare statement for tableExists: " << sqlite3_errmsg(db_) << std::endl;
-        return false;
-    }
+    SqliteStatement stmt_wrapper(db_, sql.c_str());
+    sqlite3_stmt* stmt = stmt_wrapper.stmt;
+    
+    if (stmt == nullptr) return false;
+
     sqlite3_bind_text(stmt, 1, tableName.c_str(), -1, SQLITE_STATIC);
     bool exists = (sqlite3_step(stmt) == SQLITE_ROW);
-    sqlite3_finalize(stmt);
+
     return exists;
 }
 
@@ -205,7 +212,7 @@ bool Database::initialize() {
         CREATE TRIGGER IF NOT EXISTS recipe_after_insert
         AFTER INSERT ON recipes
         BEGIN
-            INSERT INTO search(rowid, name, description, author)
+            INSERT OR REPLACE INTO search(rowid, name, description, author)
             VALUES (new.recipe_id, new.name, new.description, new.author);
         END;
 
@@ -214,7 +221,7 @@ bool Database::initialize() {
             UPDATE search
             SET
                 name = new.name,
-                description = new.description
+                description = new.description,
                 author = new.author
             WHERE rowid = new.recipe_id;
         END;
@@ -276,14 +283,14 @@ bool Database::initialize() {
             WHERE rowid = OLD.recipe_id;
         END;
 
-        INSERT INTO search (rowid, name, description, ingredients, tags)
+        INSERT OR REPLACE INTO search (rowid, name, description, author, ingredients, tags)
         SELECT
             r.recipe_id,
             r.name,
             r.description,
             r.author,
-            COALESCE(group_concat(DISTINCT i.name, '|'), ''),
-            COALESCE(group_concat(DISTINCT t.name, '|'), '')
+            COALESCE(group_concat(i.name, '|'), ''),
+            COALESCE(group_concat(t.name, '|'), '')
         FROM recipes AS r
         LEFT JOIN recipe_ingredients AS ri ON r.recipe_id = ri.recipe_id
         LEFT JOIN ingredients AS i ON ri.ingredient_id = i.ingredient_id
@@ -308,10 +315,16 @@ bool Database::initialize() {
     return true;
 }
 
+
 long long Database::addRecipe(const RecipeData& recipe) {
     if (!isOpen()) {
         std::cerr << "Database not open. Cannot execute SQL." << std::endl;
         return false;
+    }
+
+    if (recipe.name.empty()) {
+        std::cerr << "Recipe name cannot be empty. Recipe not added." << std::endl;
+        return -1;
     }
 
     if (!executeSQL("BEGIN TRANSACTION;")) {
@@ -319,7 +332,6 @@ long long Database::addRecipe(const RecipeData& recipe) {
         return -1;
     }
 
-    sqlite3_stmt* stmt = nullptr;
     long long new_recipe_id = -1;
 
     // Insert into recipes table
@@ -327,8 +339,11 @@ long long Database::addRecipe(const RecipeData& recipe) {
         INSERT INTO recipes (name, description, prep_time_minutes, cook_time_minutes, servings, is_favorite, source, source_url, author)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
     )";
-    if (sqlite3_prepare_v2(db_, recipe_sql, -1, &stmt, nullptr) != SQLITE_OK) {
-        std::cerr << "Failed to prepare insert recipe statement: " << sqlite3_errmsg(db_) << std::endl;
+
+    SqliteStatement stmt_wrapper(db_, recipe_sql);
+    sqlite3_stmt* stmt = stmt_wrapper.stmt;
+
+    if (stmt == nullptr) {
         executeSQL("ROLLBACK;");
         return -1;
     }
@@ -345,12 +360,10 @@ long long Database::addRecipe(const RecipeData& recipe) {
 
     if (sqlite3_step(stmt) != SQLITE_DONE) {
         std::cerr << "Failed to insert recipe: " << sqlite3_errmsg(db_) << std::endl;
-        sqlite3_finalize(stmt);
         executeSQL("ROLLBACK;");
         return -1;
     }
     new_recipe_id = sqlite3_last_insert_rowid(db_);
-    sqlite3_finalize(stmt);
     stmt = nullptr;
 
     // Insert ingredients into recipe_ingredients table
@@ -408,11 +421,11 @@ bool Database::deleteRecipe(long long recipe_id) {
         return false;
     }
 
-    sqlite3_stmt* stmt = nullptr;
     const char* delete_recipe_sql = "DELETE FROM recipes WHERE recipe_id = ?;";
+    SqliteStatement stmt_wrapper(db_, delete_recipe_sql);
+    sqlite3_stmt* stmt = stmt_wrapper.stmt;
 
-    if (sqlite3_prepare_v2(db_, delete_recipe_sql, -1, &stmt, nullptr) != SQLITE_OK) {
-        std::cerr << "Failed to prepare delete recipe statement: " << sqlite3_errmsg(db_) << std::endl;
+    if (stmt == nullptr) {
         executeSQL("ROLLBACK;");
         return false;
     }
@@ -421,11 +434,9 @@ bool Database::deleteRecipe(long long recipe_id) {
 
     if (sqlite3_step(stmt) != SQLITE_DONE) {
         std::cerr << "Failed to delete recipe: " << sqlite3_errmsg(db_) << std::endl;
-        sqlite3_finalize(stmt);
         executeSQL("ROLLBACK;");
         return false;
     }
-    sqlite3_finalize(stmt);
     stmt = nullptr;
     
     const char* clean_ingredients_sql = R"(
@@ -437,8 +448,8 @@ bool Database::deleteRecipe(long long recipe_id) {
     }
 
     const char* clean_tags_sql = R"(
-        DELETE FROM ingredients
-        WHERE ingredient_id NOT IN (SELECT DISTINCT ingredient_id FROM recipe_ingredients);
+        DELETE FROM tags
+        WHERE tag_id NOT IN (SELECT DISTINCT tag_id FROM recipe_tags);
     )";
     if (!executeSQL(clean_tags_sql)) {
         std::cerr << "Failed to clean tags table." << std::endl;
@@ -462,116 +473,61 @@ bool Database::mergeDatabase(const std::string& source_db_path) {
         return false;
     }
 
-    // Temporarily disable foreign key constraints to allow merging
-    if (!executeSQL("PRAGMA foreign_keys = OFF;")) {
-        std::cerr << "Failed to temporarily disable foreign key constraints." << std::endl;
-        executeSQL("ROLLBACK;");
-        return false;
-    }
+    const char* attach_db_sql = R"(
+        ATTACH DATABASE ? AS source_db;
+    )";
 
-    if (!executeSQL("BEGIN TRANSACTION;")) {
-        std::cerr << "Failed to begin transaction." << std::endl;
-        return false;
-    }
+    SqliteStatement stmt_wrapper(db_, attach_db_sql);
+    sqlite3_stmt* stmt = stmt_wrapper.stmt;
 
-    // Attach the source database
-    sqlite3_stmt* stmt = nullptr;
-    const char* attach_sql = "ATTACH DATABASE ? AS source_db;";
-
-    if (sqlite3_prepare_v2(db_, attach_sql, -1, &stmt, nullptr) != SQLITE_OK) {
-        std::cerr << "Failed to prepare insert recipe statement: " << sqlite3_errmsg(db_) << std::endl;
-        executeSQL("ROLLBACK;");
-        return false;
-    }
+    if (stmt == nullptr) return false;
 
     sqlite3_bind_text(stmt, 1, source_db_path.c_str(), -1, SQLITE_STATIC);
 
     if (sqlite3_step(stmt) != SQLITE_DONE) {
-        std::cerr << "Failed to attach source database: " << sqlite3_errmsg(db_) << std::endl;
-        sqlite3_finalize(stmt);
+        std::cerr << "Failed to delete recipe: " << sqlite3_errmsg(db_) << std::endl;
         executeSQL("ROLLBACK;");
         return false;
     }
+    stmt = nullptr;
 
-    sqlite3_finalize(stmt);
+    const char* merge_script = R"(
+        BEGIN TRANSACTION;
 
-    // STEP 1: Merge independent (ingredients and tags) tables
-    const char* merge_ingredients_sql = R"(
+        PRAGMA foreign_keys = OFF;
+
+        -- STEP 1: Merge independent (ingredients and tags) tables
         INSERT INTO main.ingredients (name) SELECT s.name FROM source_db.ingredients AS s
         WHERE NOT EXISTS (SELECT 1 FROM main.ingredients AS t WHERE lower(t.name) = lower(s.name));
-    )";
-    if (!executeSQL(merge_ingredients_sql)) {
-        std::cerr << "Failed to merge ingredients." << std::endl;
-        executeSQL("ROLLBACK;");
-        return false;
-    }
 
-    const char* create_and_populate_ingredient_map_sql = R"(
         CREATE TEMP TABLE ingredient_id_map (source_id INTEGER PRIMARY KEY, target_id INTEGER NOT NULL);
         INSERT INTO ingredient_id_map (source_id, target_id)
         SELECT s.ingredient_id, t.ingredient_id FROM source_db.ingredients AS s JOIN main.ingredients AS t ON lower(s.name) = lower(t.name);
-    )";
-    if (!executeSQL(create_and_populate_ingredient_map_sql)) {
-        std::cerr << "Failed to create and populate ingredient_id_map." << std::endl;
-        executeSQL("ROLLBACK;");
-        return false;
-    }
 
-    const char* merge_tags_sql = R"(
         INSERT INTO main.tags (name) SELECT s.name FROM source_db.tags AS s
         WHERE NOT EXISTS (SELECT 1 FROM main.tags AS t WHERE lower(t.name) = lower(s.name));
-    )";
-    if (!executeSQL(merge_tags_sql)) {
-        std::cerr << "Failed to merge tags." << std::endl;
-        executeSQL("ROLLBACK;");
-        return false;
-    }
 
-    const char* create_and_populate_tag_map_sql = R"(
         CREATE TEMP TABLE tag_id_map (source_id INTEGER PRIMARY KEY, target_id INTEGER NOT NULL);
         INSERT INTO tag_id_map (source_id, target_id)
         SELECT s.tag_id, t.tag_id FROM source_db.tags AS s JOIN main.tags AS t ON lower(s.name) = lower(t.name);
-    )";
-    if (!executeSQL(create_and_populate_tag_map_sql)) {
-        std::cerr << "Failed to create and populate tag_id_map." << std::endl;
-        executeSQL("ROLLBACK;");
-        return false;
-    }
 
-    // STEP 2: Pre-calculate ingredient set for each recipe
-    const char* calculate_recipe_ingredients_sql = R"(
+        -- STEP 2: Pre-calculate ingredient set for each recipe
         CREATE TEMP TABLE source_recipe_ingredients_set AS
-        SELECT ri.recipe_id, group_concat(i.name, '|') AS ingredient_set
-        FROM source_db.recipe_ingredients AS ri JOIN source_db.ingredients AS i ON ri.ingredient_id = i.ingredient_id
-        GROUP BY ri.recipe_id
-        ORDER BY i.name;
+        SELECT recipe_id, group_concat(name, '|') as ingredient_set FROM
+            (SELECT ri.recipe_id, i.name FROM source_db.recipe_ingredients AS ri JOIN source_db.ingredients AS i ON ri.ingredient_id = i.ingredient_id ORDER BY i.name)
+        GROUP BY recipe_id;
 
         CREATE TEMP TABLE target_recipe_ingredients_set AS
-        SELECT ri.recipe_id, group_concat(i.name, '|') AS ingredient_set
-        FROM main.recipe_ingredients AS ri JOIN main.ingredients AS i ON ri.ingredient_id = i.ingredient_id
-        GROUP BY ri.recipe_id
-        ORDER BY i.name;
-    )";
-    if (!executeSQL(calculate_recipe_ingredients_sql)) {
-        std::cerr << "Failed to calculate recipe ingredients sets." << std::endl;
-        executeSQL("ROLLBACK;");
-        return false;
-    }
+        SELECT recipe_id, group_concat(name, '|') as ingredient_set FROM
+            (SELECT ri.recipe_id, i.name FROM main.recipe_ingredients AS ri JOIN main.ingredients AS i ON ri.ingredient_id = i.ingredient_id ORDER BY i.name)
+        GROUP BY recipe_id;
 
-    // STEP 3: Build master recipe map
-    const char* initialize_map_sql = R"(
+        -- STEP 3: Build master recipe map
         CREATE TEMP TABLE recipe_id_map (source_id INTEGER PRIMARY KEY, target_id INTEGER NOT NULL, is_duplicate BOOLEAN NOT NULL);
         CREATE TEMP TABLE vars(max_recipe_id INTEGER);
         INSERT INTO vars(max_recipe_id) SELECT IFNULL(MAX(recipe_id), 0) FROM main.recipes;
-    )";
-    if (!executeSQL(initialize_map_sql)) {
-        std::cerr << "Failed to initialize recipe ID map." << std::endl;
-        executeSQL("ROLLBACK;");
-        return false;
-    }
 
-    // Pass 1: Identify and map duplicates
-    const char* pass1_sql = R"(
+        --Pass 1: Identify and map duplicates
         INSERT INTO recipe_id_map (source_id, target_id, is_duplicate)
         SELECT
             s.recipe_id,
@@ -588,15 +544,8 @@ bool Database::mergeDatabase(const std::string& source_db_path) {
                 (s.source IS NOT NULL AND s.source != '' AND lower(s.source) = lower(t.source)) OR
                 (s.source_url IS NOT NULL AND s.source_url != '' AND lower(s.source_url) = lower(t.source_url))
             );
-    )";
-    if (!executeSQL(pass1_sql)) {
-        std::cerr << "Failed to identify duplicates in recipes." << std::endl;
-        executeSQL("ROLLBACK;");
-        return false;
-    }
 
-    // Pass 2: Identify and map unique recipes
-    const char* pass2_sql = R"(
+        --Pass 2: Identify and map unique recipes
         INSERT INTO recipe_id_map (source_id, target_id, is_duplicate)
         SELECT
             s.recipe_id,
@@ -604,15 +553,8 @@ bool Database::mergeDatabase(const std::string& source_db_path) {
             0
         FROM source_db.recipes AS s
         WHERE s.recipe_id NOT IN (SELECT source_id FROM recipe_id_map);
-    )";
-    if (!executeSQL(pass2_sql) || !executeSQL(pass2_sql)) {
-        std::cerr << "Failed to build master recipe map." << std::endl;
-        executeSQL("ROLLBACK;");
-        return false;
-    }
 
-    // STEP 4: Perform merge based on map
-    const char* insert_new_recipes_sql = R"(
+        --STEP 4: Perform merge based on map
         INSERT INTO main.recipes (
             recipe_id, name, description, prep_time_minutes, cook_time_minutes,
             servings, is_favorite, date_added, source, source_url, author
@@ -632,15 +574,7 @@ bool Database::mergeDatabase(const std::string& source_db_path) {
         FROM source_db.recipes AS s
         JOIN recipe_id_map AS map ON s.recipe_id = map.source_id
         WHERE map.is_duplicate = 0;
-    )";
-    if (!executeSQL(insert_new_recipes_sql)) {
-        std::cerr << "Failed to insert new recipes." << std::endl;
-        executeSQL("ROLLBACK;");
-        return false;
-    }
 
-    // Merge tags for duplicate recipes
-    const char* merge_recipe_tags_sql = R"(
         INSERT OR IGNORE INTO main.recipe_tags (recipe_id, tag_id)
         SELECT
             map.target_id,
@@ -649,14 +583,7 @@ bool Database::mergeDatabase(const std::string& source_db_path) {
         JOIN recipe_id_map AS map ON s_rt.recipe_id = map.source_id
         JOIN tag_id_map AS tag_map ON s_rt.tag_id = tag_map.source_id
         WHERE map.is_duplicate = 1;
-    )";
-    if (!executeSQL(merge_recipe_tags_sql)) {
-        std::cerr << "Failed to merge tags for duplicate recipes." << std::endl;
-        executeSQL("ROLLBACK;");
-        return false;
-    }
 
-    const char* insert_new_ingredients_sql = R"(
         INSERT INTO main.recipe_ingredients (
             recipe_id, ingredient_id, quantity, unit, notes, optional
         )
@@ -671,14 +598,7 @@ bool Database::mergeDatabase(const std::string& source_db_path) {
         JOIN recipe_id_map AS map ON s_ri.recipe_id = map.source_id
         JOIN ingredient_id_map AS ing_map ON s_ri.ingredient_id = ing_map.source_id
         WHERE map.is_duplicate = 0; -- Only insert for new recipes
-    )";
-    if (!executeSQL(insert_new_ingredients_sql)) {
-        std::cerr << "Failed to insert new ingredients." << std::endl;
-        executeSQL("ROLLBACK;");
-        return false;
-    }
 
-    const char* insert_new_tags_sql = R"(
         INSERT INTO main.recipe_tags (recipe_id, tag_id)
         SELECT
             map.target_id,
@@ -686,15 +606,8 @@ bool Database::mergeDatabase(const std::string& source_db_path) {
         FROM source_db.recipe_tags AS s_rt
         JOIN recipe_id_map AS map ON s_rt.recipe_id = map.source_id
         JOIN tag_id_map AS tag_map ON s_rt.tag_id = tag_map.source_id
-        WHERE map.is_duplicate = 0; 
-    )";
-    if (!executeSQL(insert_new_tags_sql)) {
-        std::cerr << "Failed to insert new tags." << std::endl;
-        executeSQL("ROLLBACK;");
-        return false;
-    }
+        WHERE map.is_duplicate = 0;
 
-    const char* insert_instructions_sql = R"(
         INSERT INTO main.instructions (recipe_id, step_number, instruction)
         SELECT
             map.target_id, -- The new, offset recipe ID
@@ -703,48 +616,36 @@ bool Database::mergeDatabase(const std::string& source_db_path) {
         FROM source_db.instructions AS s_inst
         JOIN recipe_id_map AS map ON s_inst.recipe_id = map.source_id
         WHERE map.is_duplicate = 0;
-    )";
-    if (!executeSQL(insert_instructions_sql)) {
-        std::cerr << "Failed to insert instructions." << std::endl;
-        executeSQL("ROLLBACK;");
-        return false;
-    }
 
-    // STEP 5: Finalize
-    const char* remove_temporary_tables_sql = R"(
+        --STEP 5: Finalize
         DROP TABLE ingredient_id_map;
         DROP TABLE tag_id_map;
         DROP TABLE source_recipe_ingredients_set;
         DROP TABLE target_recipe_ingredients_set;
         DROP TABLE recipe_id_map;
         DROP TABLE vars;
+
+        PRAGMA foreign_keys = ON;
+        PRAGMA foreign_key_check;
+
+        COMMIT;
     )";
-    if (!executeSQL(remove_temporary_tables_sql)) {
-        std::cerr << "Failed to remove temporary tables." << std::endl;
+
+    bool script_ran_successfully = executeSQL(merge_script);
+
+    if (!script_ran_successfully) {
+        std::cerr << "Failed to execute merge script" << std::endl;
         executeSQL("ROLLBACK;");
+    }
+
+    if (!executeSQL("DETACH DATABASE source_db;")) {
+        std::cerr << "Failed to detach source database";
         return false;
     }
 
-    if (!executeSQL("PRAGMA foreign_keys = ON;")) {
-        std::cerr << "Failed to reenable foreign key constraints." << std::endl;
-        executeSQL("ROLLBACK;");
-        return false;
-    }
-
-    if (!executeSQL("PRAGMA foreign_key_check;")) {
-        std::cerr << "Foreign key check failed after merge." << std::endl;
-        executeSQL("ROLLBACK;");
-        return false;
-    }
-
-    if (!executeSQL("COMMIT;")) {
-        std::cerr << "Failed to commit transaction for merge." << std::endl;
-        executeSQL("ROLLBACK;");
-        return false;
-    }
-
-    return true;
+    return script_ran_successfully;
 }
+
 
 bool Database::loadDatabase(const std::string& db_path) {
     close();
@@ -752,66 +653,33 @@ bool Database::loadDatabase(const std::string& db_path) {
     return open(db_path);
 }
 
+
 bool Database::emptyDatabase() {
     if (!isOpen()) {
         std::cerr << "Database not open. Cannot empty database." << std::endl;
         return false;
     }
 
-    if (!executeSQL("BEGIN TRANSACTION;")) {
+    const char* delete_all_sql = R"(
+        BEGIN TRANSACTION;
+
+        DELETE FROM recipes;
+        DELETE FROM ingredients;
+        DELETE FROM tags;
+        DELETE FROM search;
+        DELETE FROM sqlite_sequence WHERE name IN ('recipes', 'ingredients', 'tags', 'instructions');
+
+        COMMIT;
+    )";
+
+    if (!executeSQL(delete_all_sql)) {
         std::cerr << "Failed to begin transaction." << std::endl;
-        return false;
-    }
-
-    // Delete all data from child tables
-    if (!executeSQL("DELETE FROM instructions;")) {
-        std::cerr << "Failed to delete from instructions table." << std::endl;
-        executeSQL("ROLLBACK;");
-        return false;
-    }
-    if (!executeSQL("DELETE FROM recipe_tags;")) {
-        std::cerr << "Failed to delete from recipe_tags table." << std::endl;
-        executeSQL("ROLLBACK;");
-        return false;
-    }
-    if (!executeSQL("DELETE FROM recipe_ingredients;")) {
-        std::cerr << "Failed to delete from recipe_ingredients table." << std::endl;
-        executeSQL("ROLLBACK;");
-        return false;
-    }
-
-    // Delete all data from parent tables
-    if (!executeSQL("DELETE FROM recipes;")) {
-        std::cerr << "Failed to delete from recipes table." << std::endl;
-        executeSQL("ROLLBACK;");
-        return false;
-    }
-    if (!executeSQL("DELETE FROM ingredients;")) {
-        std::cerr << "Failed to delete from ingredients table." << std::endl;
-        executeSQL("ROLLBACK;");
-        return false;
-    }
-    if (!executeSQL("DELETE FROM tags;")) {
-        std::cerr << "Failed to delete from tags table." << std::endl;
-        executeSQL("ROLLBACK;");
-        return false;
-    }
-
-    // Reset AUTOINCREMENT counters
-    if (!executeSQL("DELETE FROM sqlite_sequence WHERE name IN ('recipes', 'ingredients', 'tags', 'instructions');")) {
-        std::cerr << "Failed to reset AUTOINCREMENT counters." << std::endl;
-        executeSQL("ROLLBACK;");
-        return false;
-    }
-
-    if (!executeSQL("COMMIT;")) {
-        std::cerr << "Failed to commit transaction." << std::endl;
-        executeSQL("ROLLBACK;");
         return false;
     }
 
     return true;
 }
+
 
 long long Database::getOrCreateIngredientId(const std::string& name) {
     if (!isOpen()) {
@@ -824,18 +692,17 @@ long long Database::getOrCreateIngredientId(const std::string& name) {
         return -1;
     }
 
-    sqlite3_stmt* stmt = nullptr;
     const char* select_sql = "SELECT ingredient_id FROM ingredients WHERE name = ?;";
-    if (sqlite3_prepare_v2(db_, select_sql, -1, &stmt, nullptr) != SQLITE_OK) {
-        std::cerr << "Failed to prepare select ingredient statement: " << sqlite3_errmsg(db_) << std::endl;
-        return -1;
-    }
+    SqliteStatement stmt_wrapper(db_, select_sql);
+    sqlite3_stmt* stmt = stmt_wrapper.stmt;
+
+
+    if (stmt == nullptr) return -1;
+    
     sqlite3_bind_text(stmt, 1, name.c_str(), -1, SQLITE_STATIC);
     long long ingredient_id = -1;
-    if (sqlite3_step(stmt) == SQLITE_ROW) {
-        ingredient_id = sqlite3_column_int64(stmt, 0);
-    }
-    sqlite3_finalize(stmt);
+    if (sqlite3_step(stmt) == SQLITE_ROW) ingredient_id = sqlite3_column_int64(stmt, 0);
+    
     stmt = nullptr;
     if (ingredient_id != -1) {
         return ingredient_id;
@@ -843,18 +710,19 @@ long long Database::getOrCreateIngredientId(const std::string& name) {
 
     // Ingredient not found, insert it
     const char* insert_sql = "INSERT INTO ingredients (name) VALUES (?);";
-    if (sqlite3_prepare_v2(db_, insert_sql, -1, &stmt, nullptr) != SQLITE_OK) {
-        std::cerr << "Failed to prepare insert ingredient statement: " << sqlite3_errmsg(db_) << std::endl;
-        return -1;
-    }   
+    SqliteStatement insert_stmt_wrapper(db_, insert_sql);
+    stmt = insert_stmt_wrapper.stmt;
+
+    if (stmt == nullptr) return -1;
+
     sqlite3_bind_text(stmt, 1, name.c_str(), -1, SQLITE_STATIC);
     if (sqlite3_step(stmt) != SQLITE_DONE) {
         std::cerr << "Failed to insert ingredient: " << sqlite3_errmsg(db_) << std::endl;
-        sqlite3_finalize(stmt);
         return -1;
     }
-    sqlite3_finalize(stmt);
+
     stmt = nullptr;
+
     // Return the newly created ingredient ID
     ingredient_id = sqlite3_last_insert_rowid(db_);
     if (ingredient_id == -1) {
@@ -863,6 +731,7 @@ long long Database::getOrCreateIngredientId(const std::string& name) {
     }
     return ingredient_id;
 }
+
 
 long long Database::getOrCreateTagId(const std::string& name) {
     if (!isOpen()) {
@@ -875,36 +744,34 @@ long long Database::getOrCreateTagId(const std::string& name) {
         return -1;
     }
 
-    sqlite3_stmt* stmt = nullptr;
     const char* select_sql = "SELECT tag_id FROM tags WHERE name = ?;";
-    if (sqlite3_prepare_v2(db_, select_sql, -1, &stmt, nullptr) != SQLITE_OK) {
-        std::cerr << "Failed to prepare select tag statement: " << sqlite3_errmsg(db_) << std::endl;
-        return -1;
-    }
+    SqliteStatement stmt_wrapper(db_, select_sql);
+    sqlite3_stmt* stmt = stmt_wrapper.stmt;
+
+    if (stmt == nullptr) return -1;
+
     sqlite3_bind_text(stmt, 1, name.c_str(), -1, SQLITE_STATIC);
     long long tag_id = -1;
     if (sqlite3_step(stmt) == SQLITE_ROW) {
         tag_id = sqlite3_column_int64(stmt, 0);
     }
-    sqlite3_finalize(stmt);
+
     stmt = nullptr;
-    if (tag_id != -1) {
-        return tag_id;
-    }
+    if (tag_id != -1) return tag_id;
 
     // Tag not found, insert it
     const char* insert_sql = "INSERT INTO tags (name) VALUES (?);";
-    if (sqlite3_prepare_v2(db_, insert_sql, -1, &stmt, nullptr) != SQLITE_OK) {
-        std::cerr << "Failed to prepare insert tag statement: " << sqlite3_errmsg(db_) << std::endl;
-        return -1;
-    }   
+    SqliteStatement insert_stmt_wrapper(db_, insert_sql);
+    stmt = insert_stmt_wrapper.stmt;
+
+    if (stmt == nullptr) return -1;
+
     sqlite3_bind_text(stmt, 1, name.c_str(), -1, SQLITE_STATIC);
     if (sqlite3_step(stmt) != SQLITE_DONE) {
         std::cerr << "Failed to insert tag: " << sqlite3_errmsg(db_) << std::endl;
-        sqlite3_finalize(stmt);
         return -1;
     }
-    sqlite3_finalize(stmt);
+
     stmt = nullptr;
     
     // Return the newly created tag ID
@@ -917,6 +784,7 @@ long long Database::getOrCreateTagId(const std::string& name) {
     return tag_id;
 }
 
+
 bool Database::addInstruction(long long recipe_id, int step_number, const std::string& instruction) {
     if (!isOpen()) {
         std::cerr << "Database not open. Cannot add instruction." << std::endl;
@@ -928,16 +796,14 @@ bool Database::addInstruction(long long recipe_id, int step_number, const std::s
         return false;
     }
 
-    sqlite3_stmt* stmt = nullptr;
     const char* insert_sql = R"(
         INSERT INTO instructions (recipe_id, step_number, instruction)
         VALUES (?, ?, ?);
     )";
+    SqliteStatement stmt_wrapper(db_, insert_sql);
+    sqlite3_stmt* stmt = stmt_wrapper.stmt;
     
-    if (sqlite3_prepare_v2(db_, insert_sql, -1, &stmt, nullptr) != SQLITE_OK) {
-        std::cerr << "Failed to prepare insert instruction statement: " << sqlite3_errmsg(db_) << std::endl;
-        return false;
-    }
+    if (stmt == nullptr) return false;
 
     sqlite3_bind_int64(stmt, 1, recipe_id);
     sqlite3_bind_int(stmt, 2, step_number);
@@ -945,13 +811,12 @@ bool Database::addInstruction(long long recipe_id, int step_number, const std::s
 
     if (sqlite3_step(stmt) != SQLITE_DONE) {
         std::cerr << "Failed to insert instruction: " << sqlite3_errmsg(db_) << std::endl;
-        sqlite3_finalize(stmt);
         return false;
     }
 
-    sqlite3_finalize(stmt);
     return true;
 }
+
 
 bool Database::linkIngredientToRecipe(long long recipe_id, const RecipeIngredientInfo& ingredient) {
     if (!isOpen()) {
@@ -970,16 +835,15 @@ bool Database::linkIngredientToRecipe(long long recipe_id, const RecipeIngredien
         return false;
     }
 
-    sqlite3_stmt* stmt = nullptr;
     const char* insert_sql = R"(
         INSERT INTO recipe_ingredients (recipe_id, ingredient_id, quantity, unit, notes, optional)
         VALUES (?, ?, ?, ?, ?, ?);
     )";
 
-    if (sqlite3_prepare_v2(db_, insert_sql, -1, &stmt, nullptr) != SQLITE_OK) {
-        std::cerr << "Failed to prepare insert recipe_ingredients statement: " << sqlite3_errmsg(db_) << std::endl;
-        return false;
-    }
+    SqliteStatement stmt_wrapper(db_, insert_sql);
+    sqlite3_stmt* stmt = stmt_wrapper.stmt;
+
+    if (stmt == nullptr) return false;
 
     sqlite3_bind_int64(stmt, 1, recipe_id);
     sqlite3_bind_int64(stmt, 2, ingredient_id);
@@ -990,13 +854,12 @@ bool Database::linkIngredientToRecipe(long long recipe_id, const RecipeIngredien
 
     if (sqlite3_step(stmt) != SQLITE_DONE) {
         std::cerr << "Failed to insert recipe_ingredient: " << sqlite3_errmsg(db_) << std::endl;
-        sqlite3_finalize(stmt);
         return false;
     }
 
-    sqlite3_finalize(stmt);
     return true;
 }
+
 
 bool Database::linkTagToRecipe(long long recipe_id, const std::string& tag) {
     if (!isOpen()) {
@@ -1015,45 +878,39 @@ bool Database::linkTagToRecipe(long long recipe_id, const std::string& tag) {
         return false;
     }
 
-    sqlite3_stmt* stmt = nullptr;
     const char* insert_sql = R"(
         INSERT INTO recipe_tags (recipe_id, tag_id)
         VALUES (?, ?);
     )";
+    SqliteStatement stmt_wrapper(db_, insert_sql);
+    sqlite3_stmt* stmt = stmt_wrapper.stmt;
 
-    if (sqlite3_prepare_v2(db_, insert_sql, -1, &stmt, nullptr) != SQLITE_OK) {
-        std::cerr << "Failed to prepare insert recipe_tags statement: " << sqlite3_errmsg(db_) << std::endl;
-        return false;
-    }
+    if (stmt == nullptr) return false;
 
     sqlite3_bind_int64(stmt, 1, recipe_id);
     sqlite3_bind_int64(stmt, 2, tag_id);
 
     if (sqlite3_step(stmt) != SQLITE_DONE) {
         std::cerr << "Failed to insert recipe_tag: " << sqlite3_errmsg(db_) << std::endl;
-        sqlite3_finalize(stmt);
         return false;
     }
 
-    sqlite3_finalize(stmt);
     return true;
 }
 
-RecipeData Database::getRecipeById(long long recipe_id) {
-    RecipeData recipe;
+
+std::optional<RecipeData> Database::getRecipeById(long long recipe_id) {
     if (!isOpen()) {
         std::cerr << "Database not open. Cannot get recipe by ID." << std::endl;
-        return recipe; // Return empty recipe
+        return std::nullopt;
     }
 
     if (recipe_id <= 0) {
         std::cerr << "Invalid recipe ID: " << recipe_id << std::endl;
-        return recipe; // Return empty recipe
+        return std::nullopt;
     }
 
-
     // Get information from recipes table
-    sqlite3_stmt* stmt = nullptr;
     const char* select_sql = R"(
         SELECT
             r.name,
@@ -1089,38 +946,56 @@ RecipeData Database::getRecipeById(long long recipe_id) {
         WHERE
             r.recipe_id = ?;
     )";
+    SqliteStatement stmt_wrapper(db_, select_sql);
+    sqlite3_stmt* stmt = stmt_wrapper.stmt;
 
-    if (sqlite3_prepare_v2(db_, select_sql, -1, &stmt, nullptr) != SQLITE_OK) {
-        std::cerr << "Failed to prepare select recipe statement: " << sqlite3_errmsg(db_) << std::endl;
-        return recipe; // Return empty recipe
-    }
+    if (stmt == nullptr) return std::nullopt;
 
     if (sqlite3_bind_int64(stmt, 1, recipe_id) != SQLITE_OK) {
         std::cerr << "Failed to bind recipe ID: " << sqlite3_errmsg(db_) << std::endl;
-        sqlite3_finalize(stmt);
-        return recipe; // Return empty recipe
+        return std::nullopt;
     }
 
     int rc = sqlite3_step(stmt);
     if (rc == SQLITE_ROW) {
-        recipe.name = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
-        recipe.description = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+        RecipeData recipe;
+        const char* temp_ptr = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+        recipe.name = (temp_ptr ? temp_ptr : "");
+
+        temp_ptr = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+        recipe.description = (temp_ptr ? temp_ptr : "");
+
         recipe.prep_time_minutes = sqlite3_column_int(stmt, 2);
         recipe.cook_time_minutes = sqlite3_column_int(stmt, 3);
         recipe.servings = sqlite3_column_int(stmt, 4);
         recipe.is_favorite = sqlite3_column_int(stmt, 5) != 0;
-        recipe.source = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 6));
-        recipe.source_url = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 7));
-        recipe.author = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 8));
-        recipe.ingredients = parseAllIngredients(reinterpret_cast<const char*>(sqlite3_column_text(stmt, 9)));
-        recipe.tags = splitString(reinterpret_cast<const char*>(sqlite3_column_text(stmt, 10)), '|');
-        std::string instruction_list = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 11));
-    } else if (rc != SQLITE_DONE) {
-        std::cerr << "Failed to get recipe by ID: " << sqlite3_errmsg(db_) << std::endl;
-    }
 
-    return recipe;
+        temp_ptr = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 6));
+        recipe.source = (temp_ptr ? temp_ptr : "");
+
+        temp_ptr = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 7));
+        recipe.source_url = (temp_ptr ? temp_ptr : "");
+
+        temp_ptr = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 8));
+        recipe.author = (temp_ptr ? temp_ptr : "");
+
+        temp_ptr = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 9));
+        recipe.ingredients = parseAllIngredients((temp_ptr ? temp_ptr : ""));
+
+        temp_ptr = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 10));
+        recipe.tags = splitString((temp_ptr ? temp_ptr : ""), '|');
+
+        temp_ptr = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 11));
+        recipe.instructions = splitString((temp_ptr ? temp_ptr : ""), '|');
+        return recipe;
+    } else if (rc == SQLITE_DONE) {
+        return std::nullopt;
+    } else {
+        std::cerr << "Failed to get recipe by ID: " << sqlite3_errmsg(db_) << std::endl;
+        return std::nullopt;
+    }
 }
+
 
 std::vector<std::string> splitString(const std::string& str, char delimiter) {
     std::vector<std::string> tokens;
@@ -1134,6 +1009,7 @@ std::vector<std::string> splitString(const std::string& str, char delimiter) {
     return tokens;
 }
 
+
 RecipeIngredientInfo getIngredientInfo(const std::string& ingredient_str) {
     RecipeIngredientInfo ingredient;
     std::stringstream ss(ingredient_str);
@@ -1142,14 +1018,18 @@ RecipeIngredientInfo getIngredientInfo(const std::string& ingredient_str) {
     std::getline(ss, token, '|');
     ingredient.name = token;
 
-    double q;
-    try {
-        std::getline(ss, token, '|');
-        q = std::stod(token);
-    } catch (const std::invalid_argument& ia) {
-        q = -1;
+    if (std::getline(ss, token, '|')) {
+    if (!token.empty()) {
+        try {
+            ingredient.quantity = std::stod(token);
+        } catch (const std::exception& e) {
+            std::cerr << "Warning: Could not parse quantity '" << token << "'. Defaulting to 0.\n";
+            ingredient.quantity = 0.0;
+        }
+    } else {
+        ingredient.quantity = 0.0;
     }
-    ingredient.quantity = q;
+}
 
     std::getline(ss, token, '|');
     ingredient.unit = token;
@@ -1167,11 +1047,13 @@ RecipeIngredientInfo getIngredientInfo(const std::string& ingredient_str) {
     return ingredient;
 }
 
+
 std::vector<RecipeIngredientInfo> parseAllIngredients(const std::string& all_ingredients_str) {
     auto result_view = splitString(all_ingredients_str, '\n') | std::views::transform(getIngredientInfo);
     
     return std::vector<RecipeIngredientInfo>(result_view.begin(), result_view.end());
 }
+
 
 std::pair<std::string, std::vector<SqlValue>> Database::buildSearchQuery(const SearchData& criteria) {
     std::string sql = "SELECT DISTINCT r.recipe_id FROM recipes AS r";
@@ -1179,29 +1061,28 @@ std::pair<std::string, std::vector<SqlValue>> Database::buildSearchQuery(const S
     std::vector<SqlValue> params;
 
     // Handle FTS criteria
-    std::vector<std::string> fts_criteria;
+    std::string fts_match_query;
+    if (!criteria.keywords.empty()) {
+        fts_match_query += criteria.keywords + " ";
+    }
     if (!criteria.name.empty()) {
-        fts_criteria.push_back("{name} : ?");
-        params.push_back(criteria.name);
+        fts_match_query += "{name} : \"" + criteria.name + "\" ";
     }
     if (!criteria.author.empty()) {
-        fts_criteria.push_back("{author} : ?");
-        params.push_back(criteria.name);
-    }
-    if (!criteria.keywords.empty()) {
-        fts_criteria.push_back("?");
-        params.push_back(criteria.keywords);
+        fts_match_query += "{author} : \"" + criteria.author + "\" ";
     }
 
-    if (!fts_criteria.empty()) {
-        std::string fts_query = std::accumulate(std::next(fts_criteria.begin()), fts_criteria.end(), fts_criteria.front(),
-            [](std::string a, std::string b) { return a + " AND " + b; });
-        conditions.push_back("r.recipe_in IN (SELECT rowid FROM search WHERE search MATCH ?)");
-        params.push_back(fts_query);
+    if (!fts_match_query.empty()) {
+        if (fts_match_query.back() == ' ') {
+            fts_match_query.pop_back();
+        }
+        
+        conditions.push_back("r.recipe_id IN (SELECT rowid FROM search WHERE search MATCH ?)");
+        params.push_back(fts_match_query);
     }
 
     // Handle main table criteria
-    if (criteria.exact_name.empty()) {
+    if (!criteria.exact_name.empty()) {
         conditions.push_back("r.name = ?");
         params.push_back(criteria.exact_name);
     }
@@ -1215,12 +1096,12 @@ std::pair<std::string, std::vector<SqlValue>> Database::buildSearchQuery(const S
         params.push_back(criteria.prep_time_range[1]);
     }
     if (criteria.cook_time_range.size() == 2) {
-        conditions.push_back("r.prep_time_minutes BETWEEN ? AND ?");
+        conditions.push_back("r.cook_time_minutes BETWEEN ? AND ?");
         params.push_back(criteria.cook_time_range[0]);
         params.push_back(criteria.cook_time_range[1]);
     }
     if (criteria.servings_range.size() == 2) {
-        conditions.push_back("r.prep_time_minutes BETWEEN ? AND ?");
+        conditions.push_back("r.servings BETWEEN ? AND ?");
         params.push_back(criteria.servings_range[0]);
         params.push_back(criteria.servings_range[1]);
     }
@@ -1232,11 +1113,11 @@ std::pair<std::string, std::vector<SqlValue>> Database::buildSearchQuery(const S
         params.push_back(criteria.dates[0]);
         params.push_back(criteria.dates[1]);
     }
-    if (criteria.source.empty()) {
+    if (!criteria.source.empty()) {
         conditions.push_back("r.source = ?");
         params.push_back(criteria.source);
     }
-    if (criteria.source_url.empty()) {
+    if (!criteria.source_url.empty()) {
         conditions.push_back("r.source_url = ?");
         params.push_back(criteria.source_url);
     }
@@ -1245,7 +1126,7 @@ std::pair<std::string, std::vector<SqlValue>> Database::buildSearchQuery(const S
     if (!criteria.tags.empty()) {
         std::string placeholders;
         for (int i = 0; i < criteria.tags.size(); ++i) {
-            placeholders += (i == 0 ? "?" : ": ?");
+            placeholders += (i == 0 ? "?" : ", ?");
         }
         std::string subquery = R"(r.recipe_id IN (
             SELECT rt.recipe_id FROM recipe_tags rt JOIN tags t ON rt.tag_id = t.tag_id
@@ -1279,7 +1160,7 @@ std::pair<std::string, std::vector<SqlValue>> Database::buildSearchQuery(const S
     if (!criteria.ingredients.empty()) {
         std::string placeholders;
         for (int i = 0; i < criteria.ingredients.size(); ++i) {
-            placeholders += (i == 0 ? "?" : ": ?");
+            placeholders += (i == 0 ? "?" : ", ?");
         }
         std::string subquery = R"(r.recipe_id IN (
             SELECT ri.recipe_id FROM recipe_ingredients ri JOIN ingredients i ON ri.ingredient_id = i.ingredient_id
@@ -1321,15 +1202,13 @@ std::pair<std::string, std::vector<SqlValue>> Database::buildSearchQuery(const S
     return {sql, params};
 }
 
+
 std::vector<long long> Database::executeSearch(std::pair<std::string, std::vector<SqlValue>> query_parts) {
     const std::string& sql = query_parts.first;
     const std::vector<SqlValue>& params = query_parts.second;
 
-    sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) {
-        std::cerr << "Failed to prepare search statement: " << sqlite3_errmsg(db_) << std::endl;
-        return {};
-    }
+    SqliteStatement stmt_wrapper(db_, sql.c_str());
+    sqlite3_stmt* stmt = stmt_wrapper.stmt;
 
     for (int i = 0; i < params.size(); ++i) {
         std::visit([&](auto&& arg) {
@@ -1351,9 +1230,9 @@ std::vector<long long> Database::executeSearch(std::pair<std::string, std::vecto
         results.push_back(sqlite3_column_int64(stmt, 0));
     }
 
-    sqlite3_finalize(stmt);
     return results;
 }
+
 
 std::vector<long long> Database::search(const SearchData& criteria) {
     if (!isOpen()) {
